@@ -20,6 +20,80 @@ from tools.price_tools import (get_latest_position, get_open_prices,
 
 mcp = FastMCP("TradeTools")
 
+# ============================================================================
+# A股交易成本和滑点配置 (仅适用于 market == "cn")
+# ============================================================================
+CN_COMMISSION_RATE = 0.003      # 佣金费率: 0.3% (千分之三)
+CN_COMMISSION_MIN = 5.0         # 最低佣金: 5元
+CN_STAMP_DUTY_RATE = 0.001      # 印花税: 0.1% (千分之一, 仅卖出)
+CN_TRANSFER_FEE_RATE = 0.00001  # 过户费: 0.001% (万分之一)
+CN_SLIPPAGE_RATE = 0.002        # 固定滑点: 0.2%
+
+
+def _apply_cn_slippage(base_price: float, action: str) -> float:
+    """
+    应用A股固定滑点
+    
+    Args:
+        base_price: 基准价格（开盘价）
+        action: 'buy' 或 'sell'
+        
+    Returns:
+        应用滑点后的实际成交价
+        - 买入: base_price * (1 + 0.002) = 价格更高0.2%
+        - 卖出: base_price * (1 - 0.002) = 价格更低0.2%
+    """
+    if action == 'buy':
+        return base_price * (1 + CN_SLIPPAGE_RATE)
+    else:  # sell
+        return base_price * (1 - CN_SLIPPAGE_RATE)
+
+
+def _calculate_cn_trading_costs(action: str, price: float, amount: int) -> dict:
+    """
+    计算A股交易成本（仅限中国A股市场）
+    
+    Args:
+        action: 交易类型 'buy' 或 'sell'
+        price: 交易价格（已应用滑点后的价格）
+        amount: 交易数量
+        
+    Returns:
+        包含各项费用的字典:
+        {
+            'commission': 佣金,
+            'stamp_duty': 印花税（仅卖出时有值）,
+            'transfer_fee': 过户费,
+            'total_cost': 总成本
+        }
+        
+    费率说明:
+        - 佣金: 0.3%, 最低5元
+        - 印花税: 0.1%, 仅卖出时收取
+        - 过户费: 0.001%
+    """
+    trade_amount = price * amount
+    
+    # 1. 佣金 (买卖双向收取，最低5元)
+    commission = max(trade_amount * CN_COMMISSION_RATE, CN_COMMISSION_MIN)
+    
+    # 2. 印花税 (仅卖出时收取)
+    stamp_duty = trade_amount * CN_STAMP_DUTY_RATE if action == 'sell' else 0.0
+    
+    # 3. 过户费 (买卖双向收取)
+    transfer_fee = trade_amount * CN_TRANSFER_FEE_RATE
+    
+    # 4. 总成本
+    total_cost = commission + stamp_duty + transfer_fee
+    
+    return {
+        'commission': round(commission, 2),
+        'stamp_duty': round(stamp_duty, 2),
+        'transfer_fee': round(transfer_fee, 2),
+        'total_cost': round(total_cost, 2)
+    }
+
+
 def _position_lock(signature: str):
     """Context manager for file-based lock to serialize position updates per signature."""
     class _Lock:
@@ -159,17 +233,32 @@ def buy(symbol: str, amount: int) -> Dict[str, Any]:
             "market": market,
         }
 
-    # Step 4: Validate buy conditions
-    # Calculate cash required for purchase: stock price × buy quantity
+
+    # Step 4: Apply slippage and calculate trading costs (CN market only)
+    # For A-shares, apply 0.2% slippage and calculate trading costs
+    actual_price = this_symbol_price  # Default: use opening price as-is
+    trading_costs = None
+    
+    if market == "cn":
+        # Apply fixed slippage: buy price is 0.2% higher
+        actual_price = _apply_cn_slippage(this_symbol_price, action='buy')
+        # Calculate trading costs for A-shares
+        trading_costs = _calculate_cn_trading_costs(action='buy', price=actual_price, amount=amount)
+    
+    # Step 5: Validate buy conditions
+    # Calculate cash required: stock price × quantity + trading costs (if CN market)
+    trade_amount = actual_price * amount
+    total_cost = trade_amount + (trading_costs['total_cost'] if trading_costs else 0)
+    
     try:
-        cash_left = current_position["CASH"] - this_symbol_price * amount
+        cash_left = current_position["CASH"] - total_cost
     except Exception as e:
         # Defensive: if any unexpected structure, surface a clear error
         return {
             "error": f"Failed to compute cash after purchase: {e}",
             "symbol": symbol,
             "date": today_date,
-            "price": this_symbol_price,
+            "price": actual_price,
             "amount": amount,
             "position_keys": list(current_position.keys()),
         }
@@ -179,23 +268,25 @@ def buy(symbol: str, amount: int) -> Dict[str, Any]:
         # Insufficient cash, return error message
         return {
             "error": "Insufficient cash! This action will not be allowed.",
-            "required_cash": this_symbol_price * amount,
+            "required_cash": total_cost,
+            "trade_amount": trade_amount,
+            "trading_costs": trading_costs['total_cost'] if trading_costs else 0,
             "cash_available": current_position.get("CASH", 0),
             "symbol": symbol,
             "date": today_date,
         }
     else:
-        # Step 5: Execute buy operation, update position
+        # Step 6: Execute buy operation, update position
         # Create a copy of current position to avoid directly modifying original data
         new_position = current_position.copy()
 
-        # Decrease cash balance
+        # Decrease cash balance (including trading costs for CN market)
         new_position["CASH"] = cash_left
 
         # Increase stock position quantity
         new_position[symbol] = new_position.get(symbol, 0) + amount
 
-        # Step 6: Record transaction to position.jsonl file
+        # Step 7: Record transaction to position.jsonl file
         # Build file path: {project_root}/data/{log_path}/{signature}/position/position.jsonl
         # Use append mode ("a") to write new transaction record
         # Each operation ID increments by 1, ensuring uniqueness of operation sequence
@@ -203,26 +294,37 @@ def buy(symbol: str, amount: int) -> Dict[str, Any]:
         if log_path.startswith("./data/"):
             log_path = log_path[7:]  # Remove "./data/" prefix
         position_file_path = os.path.join(project_root, "data", log_path, signature, "position", "position.jsonl")
+        
+        # Prepare action record
+        action_record = {
+            "action": "buy",
+            "symbol": symbol,
+            "amount": amount,
+            "price": round(actual_price, 2),
+        }
+        
+        # Add trading costs details for CN market
+        if trading_costs:
+            action_record["trading_costs"] = trading_costs
+            action_record["base_price"] = round(this_symbol_price, 2)
+            action_record["slippage"] = round(actual_price - this_symbol_price, 2)
+        
         with open(position_file_path, "a") as f:
             # Write JSON format transaction record, containing date, operation ID, transaction details and updated position
-            print(
-                f"Writing to position.jsonl: {json.dumps({'date': today_date, 'id': current_action_id + 1, 'this_action':{'action':'buy','symbol':symbol,'amount':amount},'positions': new_position})}"
-            )
-            f.write(
-                json.dumps(
-                    {
-                        "date": today_date,
-                        "id": current_action_id + 1,
-                        "this_action": {"action": "buy", "symbol": symbol, "amount": amount},
-                        "positions": new_position,
-                    }
-                )
-                + "\n"
-            )
-        # Step 7: Return updated position
+            record = {
+                "date": today_date,
+                "id": current_action_id + 1,
+                "this_action": action_record,
+                "positions": new_position,
+            }
+            print(f"Writing to position.jsonl: {json.dumps(record)}")
+            f.write(json.dumps(record) + "\n")
+            
+        # Step 8: Return updated position
         write_config_value("IF_TRADE", True)
         print("IF_TRADE", get_config_value("IF_TRADE"))
         return new_position
+
 
 
 def _get_today_buy_amount(symbol: str, today_date: str, signature: str) -> int:
@@ -391,18 +493,32 @@ def sell(symbol: str, amount: int) -> Dict[str, Any]:
                     "date": today_date,
                 }
 
-    # Step 5: Execute sell operation, update position
+
+    # Step 5: Apply slippage and calculate trading costs (CN market only)
+    # For A-shares, apply 0.2% slippage and calculate trading costs
+    actual_price = this_symbol_price  # Default: use opening price as-is
+    trading_costs = None
+    
+    if market == "cn":
+        # Apply fixed slippage: sell price is 0.2% lower
+        actual_price = _apply_cn_slippage(this_symbol_price, action='sell')
+        # Calculate trading costs for A-shares (includes stamp duty for selling)
+        trading_costs = _calculate_cn_trading_costs(action='sell', price=actual_price, amount=amount)
+    
+    # Step 6: Execute sell operation, update position
     # Create a copy of current position to avoid directly modifying original data
     new_position = current_position.copy()
 
     # Decrease stock position quantity
     new_position[symbol] -= amount
 
-    # Increase cash balance: sell price × sell quantity
+    # Increase cash balance: sell price × sell quantity - trading costs (if CN market)
     # Use get method to ensure CASH field exists, default to 0 if not present
-    new_position["CASH"] = new_position.get("CASH", 0) + this_symbol_price * amount
+    trade_amount = actual_price * amount
+    net_proceeds = trade_amount - (trading_costs['total_cost'] if trading_costs else 0)
+    new_position["CASH"] = new_position.get("CASH", 0) + net_proceeds
 
-    # Step 6: Record transaction to position.jsonl file
+    # Step 7: Record transaction to position.jsonl file
     # Build file path: {project_root}/data/{log_path}/{signature}/position/position.jsonl
     # Use append mode ("a") to write new transaction record
     # Each operation ID increments by 1, ensuring uniqueness of operation sequence
@@ -410,26 +526,37 @@ def sell(symbol: str, amount: int) -> Dict[str, Any]:
     if log_path.startswith("./data/"):
         log_path = log_path[7:]  # Remove "./data/" prefix
     position_file_path = os.path.join(project_root, "data", log_path, signature, "position", "position.jsonl")
+    
+    # Prepare action record
+    action_record = {
+        "action": "sell",
+        "symbol": symbol,
+        "amount": amount,
+        "price": round(actual_price, 2),
+    }
+    
+    # Add trading costs details for CN market
+    if trading_costs:
+        action_record["trading_costs"] = trading_costs
+        action_record["base_price"] = round(this_symbol_price, 2)
+        action_record["slippage"] = round(actual_price - this_symbol_price, 2)
+        action_record["net_proceeds"] = round(net_proceeds, 2)
+    
     with open(position_file_path, "a") as f:
         # Write JSON format transaction record, containing date, operation ID and updated position
-        print(
-            f"Writing to position.jsonl: {json.dumps({'date': today_date, 'id': current_action_id + 1, 'this_action':{'action':'sell','symbol':symbol,'amount':amount},'positions': new_position})}"
-        )
-        f.write(
-            json.dumps(
-                {
-                    "date": today_date,
-                    "id": current_action_id + 1,
-                    "this_action": {"action": "sell", "symbol": symbol, "amount": amount},
-                    "positions": new_position,
-                }
-            )
-            + "\n"
-        )
+        record = {
+            "date": today_date,
+            "id": current_action_id + 1,
+            "this_action": action_record,
+            "positions": new_position,
+        }
+        print(f"Writing to position.jsonl: {json.dumps(record)}")
+        f.write(json.dumps(record) + "\n")
 
-    # Step 7: Return updated position
+    # Step 8: Return updated position
     write_config_value("IF_TRADE", True)
     return new_position
+
 
 
 if __name__ == "__main__":

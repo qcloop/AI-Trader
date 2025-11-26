@@ -146,18 +146,82 @@ def load_all_price_files(data_dir, is_crypto=False, is_astock=False):
 def calculate_portfolio_values(positions, price_data, is_crypto=False, verbose=True):
     """
     Calculate portfolio value at each timestamp.
+    
+    For A-share legacy data (without trading_costs field), this function will
+    retroactively calculate and adjust for trading costs and slippage.
 
     Returns:
         DataFrame with columns: date, cash, stock_value, total_value
     """
     portfolio_values = []
     missing_prices = set()
+    cumulative_cost_adjustment = 0  # Track cumulative cost adjustments for legacy data
+    legacy_data_detected = False
 
     for entry in positions:
         date = entry['date']
-        pos = entry['positions']
+        pos = entry['positions'].copy()  # Make a copy to avoid modifying original
+        
+        # Check if this is A-share legacy data (no trading_costs field)
+        if 'this_action' in entry:
+            action_data = entry['this_action']
+            symbol = action_data.get('symbol', '')
+            action = action_data.get('action', '')
+            
+            # Detect A-share symbols
+            is_astock = symbol.endswith('.SH') or symbol.endswith('.SZ')
+            has_costs = 'trading_costs' in action_data
+            
+            # If A-share AND no trading costs AND is a trade action
+            if is_astock and not has_costs and action in ['buy', 'sell']:
+                if not legacy_data_detected:
+                    legacy_data_detected = True
+                    if verbose:
+                        print(f"📊 Detected legacy A-share data (without trading costs). Applying retroactive cost adjustments...")
+                
+                amount = action_data.get('amount', 0)
+                if amount > 0:
+                    # Get price from price_data
+                    price = get_price_at_date(price_data, symbol, date, is_crypto)
+                    
+                    if price:
+                        # Apply slippage (0.2% fixed)
+                        if action == 'buy':
+                            actual_price = price * 1.002  # +0.2%
+                        else:  # sell
+                            actual_price = price * 0.998  # -0.2%
+                        
+                        # Calculate trading costs
+                        trade_amount = actual_price * amount
+                        
+                        # Commission: 0.3%, minimum 5元
+                        commission = max(trade_amount * 0.003, 5.0)
+                        
+                        # Stamp duty: 0.1%, only for selling
+                        stamp_duty = trade_amount * 0.001 if action == 'sell' else 0.0
+                        
+                        # Transfer fee: 0.001%
+                        transfer_fee = trade_amount * 0.00001
+                        
+                        total_cost = commission + stamp_duty + transfer_fee
+                        
+                        # Slippage cost
+                        slippage_cost = abs(actual_price - price) * amount
+                        
+                        # Total adjustment: costs + slippage
+                        # For both buy and sell, these costs reduce cash
+                        adjustment = total_cost + slippage_cost
+                        
+                        cumulative_cost_adjustment += adjustment
+                        
+                        if verbose and cumulative_cost_adjustment > 0:
+                            print(f"  {date} {action} {symbol}: cost adjustment = {adjustment:.2f} (cumulative: {cumulative_cost_adjustment:.2f})")
 
+        # Adjust CASH for legacy data
         cash = pos.get('CASH', 0)
+        if cumulative_cost_adjustment > 0:
+            cash -= cumulative_cost_adjustment
+        
         stock_value = 0
 
         # Calculate value of all stock holdings
@@ -185,6 +249,9 @@ def calculate_portfolio_values(positions, price_data, is_crypto=False, verbose=T
     df = pd.DataFrame(portfolio_values)
     df['date'] = pd.to_datetime(df['date'])
 
+    if legacy_data_detected and verbose:
+        print(f"✅ Applied total cost adjustment of {cumulative_cost_adjustment:.2f} for legacy A-share data")
+    
     if not verbose and missing_prices:
         print(f"Warning: {len(missing_prices)} missing price entries (use --verbose to see details)")
 

@@ -211,6 +211,69 @@ def calculate_asset_value(position, date, price_data, market='us'):
     return total_value
 
 
+def calculate_cn_legacy_cost_adjustment(position, price_data):
+    """
+    Calculate trading cost adjustment for A-share legacy data (without trading_costs field).
+    
+    Args:
+        position: Position entry from position.jsonl
+        price_data: Price data cache for getting historical prices
+        
+    Returns:
+        float: Cost adjustment amount to subtract from CASH
+    """
+    if 'this_action' not in position:
+        return 0.0
+    
+    action_data = position['this_action']
+    symbol = action_data.get('symbol', '')
+    action = action_data.get('action', '')
+    
+    # Only process A-share trades without trading_costs
+    is_astock = symbol.endswith('.SH') or symbol.endswith('.SZ')
+    has_costs = 'trading_costs' in action_data
+    
+    if not (is_astock and not has_costs and action in ['buy', 'sell']):
+        return 0.0
+    
+    amount = action_data.get('amount', 0)
+    if amount <= 0:
+        return 0.0
+    
+    # Get price from price_data
+    date = position['date']
+    price = get_closing_price(symbol, date, price_data, 'cn')
+    
+    if not price:
+        return 0.0
+    
+    # Apply slippage (0.2% fixed)
+    if action == 'buy':
+        actual_price = price * 1.002  # +0.2%
+    else:  # sell
+        actual_price = price * 0.998  # -0.2%
+    
+    # Calculate trading costs
+    trade_amount = actual_price * amount
+    
+    # Commission: 0.3%, minimum 5元
+    commission = max(trade_amount * 0.003, 5.0)
+    
+    # Stamp duty: 0.1%, only for selling
+    stamp_duty = trade_amount * 0.001 if action == 'sell' else 0.0
+    
+    # Transfer fee: 0.001%
+    transfer_fee = trade_amount * 0.00001
+    
+    total_cost = commission + stamp_duty + transfer_fee
+    
+    # Slippage cost
+    slippage_cost = abs(actual_price - price) * amount
+    
+    # Total adjustment
+    return total_cost + slippage_cost
+
+
 def process_agent_data_us(agent_config, market_config):
     """Process agent data for US market."""
     agent_folder = agent_config['folder']
@@ -326,8 +389,25 @@ def process_agent_data_cn(agent_config, market_config, price_cache):
     # For hourly data, just return all positions without date filling
     if preserve_hourly:
         asset_history = []
+        cumulative_cost_adjustment = 0  # Track cost adjustments for legacy data
+        legacy_detected = False
+        
         for position in unique_positions:
-            asset_value = calculate_asset_value(position, position['dateKey'], price_cache, 'cn')
+            # Calculate cost adjustment for this position (if legacy A-share data)
+            cost_adjustment = calculate_cn_legacy_cost_adjustment(position, price_cache)
+            if cost_adjustment > 0 and not legacy_detected:
+                legacy_detected = True
+                print(f"    📊 Detected legacy A-share data, applying cost adjustments...")
+            
+            cumulative_cost_adjustment += cost_adjustment
+            
+            # Calculate asset value with adjusted CASH
+            adjusted_position = position.copy()
+            adjusted_positions_dict = adjusted_position['positions'].copy()
+            adjusted_positions_dict['CASH'] -= cumulative_cost_adjustment
+            adjusted_position['positions'] = adjusted_positions_dict
+            
+            asset_value = calculate_asset_value(adjusted_position, position['dateKey'], price_cache, 'cn')
             if asset_value is not None:
                 asset_history.append({
                     'date': position['dateKey'],
@@ -342,12 +422,16 @@ def process_agent_data_cn(agent_config, market_config, price_cache):
 
         result = {
             'name': agent_folder,
-            'positions': [{'date': p['dateKey'], 'id': p['id'], 'positions': p['positions']} for p in unique_positions],
+            'positions': [{'date': p['dateKey'], 'id': p['id'], 'positions': p['positions'], 'this_action': p.get('this_action')} for p in unique_positions],
             'assetHistory': asset_history,
             'initialValue': asset_history[0]['value'] if asset_history else 10000,
             'currentValue': asset_history[-1]['value'] if asset_history else 0,
-            'return': ((asset_history[-1]['value'] - asset_history[0]['value']) / asset_history[0]['value'] * 100) if asset_history else 0
+            'return': ((asset_history[-1]['value'] - asset_history[0]['value']) / asset_history[0]['value'] * 100) if asset_history else 0,
+            'currency': 'CNY'
         }
+        
+        if legacy_detected:
+            print(f"    ✅ Applied total cost adjustment of {cumulative_cost_adjustment:.2f}")
 
         print(f"    ✓ {len(result['positions'])} positions, {len(asset_history)} data points (hourly)")
         return result
@@ -359,11 +443,26 @@ def process_agent_data_cn(agent_config, market_config, price_cache):
 
     # Create position map for quick lookup
     position_map = {pos['dateKey']: pos for pos in unique_positions}
+    
+    # Calculate cumulative cost adjustments for legacy data
+    cumulative_costs_by_date = {}
+    cumulative_cost = 0
+    legacy_detected = False
+    
+    for pos_key in sorted(position_map.keys()):
+        position = position_map[pos_key]
+        cost_adjustment = calculate_cn_legacy_cost_adjustment(position, price_cache)
+        if cost_adjustment > 0 and not legacy_detected:
+            legacy_detected = True
+            print(f"    📊 Detected legacy A-share data, applying cost adjustments...")
+        cumulative_cost += cost_adjustment
+        cumulative_costs_by_date[pos_key] = cumulative_cost
 
     # Fill all dates in range (skip weekends)
     asset_history = []
     current_position = None
     current_date = start_date
+    current_cumulative_cost = 0
 
     while current_date <= end_date:
         # Skip weekends
@@ -373,10 +472,17 @@ def process_agent_data_cn(agent_config, market_config, price_cache):
             # Use position for this date if exists, otherwise use last known position
             if date_str in position_map:
                 current_position = position_map[date_str]
+                current_cumulative_cost = cumulative_costs_by_date.get(date_str, current_cumulative_cost)
 
             if current_position:
-                # Calculate asset value
-                asset_value = calculate_asset_value(current_position, date_str, price_cache, 'cn')
+                # Calculate asset value with adjusted CASH
+                adjusted_position = current_position.copy()
+                adjusted_positions_dict = adjusted_position['positions'].copy()
+                adjusted_positions_dict['CASH'] -= current_cumulative_cost
+                adjusted_position['positions'] = adjusted_positions_dict
+                
+                asset_value = calculate_asset_value(adjusted_position, date_str, price_cache, 'cn')
+
 
                 if asset_value is not None:
                     asset_history.append({
@@ -400,7 +506,8 @@ def process_agent_data_cn(agent_config, market_config, price_cache):
         'assetHistory': asset_history,
         'initialValue': asset_history[0]['value'] if asset_history else 10000,
         'currentValue': asset_history[-1]['value'] if asset_history else 0,
-        'return': ((asset_history[-1]['value'] - asset_history[0]['value']) / asset_history[0]['value'] * 100) if asset_history else 0
+        'return': ((asset_history[-1]['value'] - asset_history[0]['value']) / asset_history[0]['value'] * 100) if asset_history else 0,
+        'currency': 'CNY'
     }
 
     print(f"    ✓ {len(positions)} positions, {len(asset_history)} data points")
